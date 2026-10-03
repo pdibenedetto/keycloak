@@ -1,7 +1,9 @@
 package org.keycloak.tests.admin.authz.rbac;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import jakarta.ws.rs.ForbiddenException;
 import jakarta.ws.rs.core.Response;
@@ -25,6 +27,8 @@ import org.keycloak.representations.idm.ClientScopeRepresentation;
 import org.keycloak.representations.idm.GroupRepresentation;
 import org.keycloak.representations.idm.IdentityProviderMapperRepresentation;
 import org.keycloak.representations.idm.IdentityProviderRepresentation;
+import org.keycloak.representations.idm.OrganizationDomainRepresentation;
+import org.keycloak.representations.idm.OrganizationRepresentation;
 import org.keycloak.representations.idm.ProtocolMapperRepresentation;
 import org.keycloak.representations.idm.RealmRepresentation;
 import org.keycloak.representations.idm.RoleRepresentation;
@@ -65,6 +69,114 @@ public class RealmAdminAccessTest extends AbstractAdminRBACTest {
             runAs(realmName, client.getClientId(), username, userClient -> {
                 userClient.realm(realmName).clients().findAll();
             });
+        });
+    }
+
+    @Test
+    public void testGroupsInRoleFiltersGroupsCallerCannotView() {
+        String realmName = "test-realm";
+        RealmResource testRealm = createRealm(adminClient, realmName);
+
+        testRealm.roles().create(RoleBuilder.create().name("shared-role").build());
+
+        ClientRepresentation appClient = new ClientRepresentation();
+        appClient.setClientId("app1");
+        appClient.setEnabled(true);
+        String appClientId;
+        try (Response response = testRealm.clients().create(appClient)) {
+            appClientId = ApiUtil.getCreatedId(response);
+        }
+        testRealm.clients().get(appClientId).roles().create(RoleBuilder.create().name("app-role").build());
+
+        GroupRepresentation secretGroup = new GroupRepresentation();
+        secretGroup.setName("secret-group");
+        secretGroup.setAttributes(Map.of("cost-center", List.of("CONFIDENTIAL-4471")));
+        String secretGroupId;
+        try (Response response = testRealm.groups().add(secretGroup)) {
+            secretGroupId = ApiUtil.getCreatedId(response);
+        }
+        GroupRepresentation visibleGroup = new GroupRepresentation();
+        visibleGroup.setName("visible-group");
+        String visibleGroupId;
+        try (Response response = testRealm.groups().add(visibleGroup)) {
+            visibleGroupId = ApiUtil.getCreatedId(response);
+        }
+
+        RoleRepresentation sharedRole = testRealm.roles().get("shared-role").toRepresentation();
+        RoleRepresentation appRole = testRealm.clients().get(appClientId).roles().get("app-role").toRepresentation();
+        testRealm.groups().group(secretGroupId).roles().realmLevel().add(List.of(sharedRole));
+        testRealm.groups().group(secretGroupId).roles().clientLevel(appClientId).add(List.of(appRole));
+        testRealm.groups().group(visibleGroupId).roles().realmLevel().add(List.of(sharedRole));
+
+        // Delegated admin can search groups and view the role containers, but cannot view any group.
+        String username = "limited-admin";
+        createUser(testRealm, username);
+        grantRealmManagementRole(testRealm, username, AdminRoles.QUERY_GROUPS);
+        grantRealmManagementRole(testRealm, username, AdminRoles.VIEW_REALM);
+        grantRealmManagementRole(testRealm, username, AdminRoles.VIEW_CLIENTS);
+
+        // A full-access admin still sees every group holding the role (no regression).
+        Set<String> groupsForFullAdmin = testRealm.roles().get("shared-role").getRoleGroupMembers().stream()
+                .map(GroupRepresentation::getName).collect(Collectors.toSet());
+        assertEquals(Set.of("secret-group", "visible-group"), groupsForFullAdmin);
+
+        runAs(realmName, "admin-cli", username, userClient -> {
+            RealmResource realm = userClient.realm(realmName);
+
+            // Control: the same caller is denied direct access to the groups.
+            assertForbidden("delegated admin must not view a group directly",
+                    () -> realm.groups().group(secretGroupId).toRepresentation());
+
+            // The role-groups endpoints must not disclose groups the caller cannot view,
+            // including with full representations (attributes and role mappings).
+            assertTrue(realm.roles().get("shared-role").getRoleGroupMembers(false, 0, 100).isEmpty(),
+                    "realm role groups endpoint disclosed groups the caller cannot view");
+            String appId = realm.clients().findByClientId("app1").get(0).getId();
+            assertTrue(realm.clients().get(appId).roles().get("app-role").getRoleGroupMembers(false, 0, 100).isEmpty(),
+                    "client role groups endpoint disclosed groups the caller cannot view");
+        });
+
+        // Once the delegated admin is allowed to view groups, the same endpoints must return them:
+        // the filter tightens access without over-restricting an authorized caller.
+        grantRealmManagementRole(testRealm, username, AdminRoles.VIEW_USERS);
+
+        runAs(realmName, "admin-cli", username, userClient -> {
+            RealmResource realm = userClient.realm(realmName);
+
+            realm.groups().group(secretGroupId).toRepresentation();
+
+            GroupRepresentation secret = realm.roles().get("shared-role").getRoleGroupMembers(false, 0, 100).stream()
+                    .filter(g -> "secret-group".equals(g.getName())).findFirst().orElseThrow();
+            assertEquals(Set.of("secret-group", "visible-group"),
+                    realm.roles().get("shared-role").getRoleGroupMembers(false, 0, 100).stream()
+                            .map(GroupRepresentation::getName).collect(Collectors.toSet()));
+            // A caller allowed to view the group and the mapped roles sees them in the full representation.
+            assertEquals(List.of("shared-role"), secret.getRealmRoles());
+            assertEquals(Map.of("app1", List.of("app-role")), secret.getClientRoles());
+
+            String appId = realm.clients().findByClientId("app1").get(0).getId();
+            Set<String> clientRoleGroups = realm.clients().get(appId).roles().get("app-role").getRoleGroupMembers(false, 0, 100).stream()
+                    .map(GroupRepresentation::getName).collect(Collectors.toSet());
+            assertEquals(Set.of("secret-group"), clientRoleGroups);
+        });
+
+        // A caller allowed to view the group but not a role mapped to it must not see that role in
+        // the representation: the group's app-role (client role) is filtered out because this admin
+        // cannot view the client or map the role.
+        String roleLimited = "role-limited-admin";
+        createUser(testRealm, roleLimited);
+        grantRealmManagementRole(testRealm, roleLimited, AdminRoles.VIEW_REALM);
+        grantRealmManagementRole(testRealm, roleLimited, AdminRoles.VIEW_USERS);
+
+        runAs(realmName, "admin-cli", roleLimited, userClient -> {
+            RealmResource realm = userClient.realm(realmName);
+
+            GroupRepresentation secret = realm.roles().get("shared-role").getRoleGroupMembers(false, 0, 100).stream()
+                    .filter(g -> "secret-group".equals(g.getName())).findFirst().orElseThrow();
+
+            assertEquals(List.of("shared-role"), secret.getRealmRoles());
+            assertTrue(secret.getClientRoles() == null || secret.getClientRoles().isEmpty(),
+                    "client role mapping the caller cannot view must be filtered from the group representation");
         });
     }
 
@@ -1253,6 +1365,196 @@ public class RealmAdminAccessTest extends AbstractAdminRBACTest {
             client.setId(ApiUtil.getCreatedId(response));
         }
         return client;
+    }
+
+    @Test
+    public void testManageUsersAdminCannotJoinUserToAdminGroup() {
+        String realmName = "test-realm";
+        RealmResource testRealm = createRealm(adminClient, realmName);
+        String attackerName = "limited-admin";
+        createUser(testRealm, attackerName);
+        grantRealmManagementRole(testRealm, attackerName, AdminRoles.MANAGE_USERS);
+
+        GroupRepresentation adminGroup = new GroupRepresentation();
+        adminGroup.setName("realm-admin-group");
+        try (Response response = testRealm.groups().add(adminGroup)) {
+            adminGroup.setId(ApiUtil.getCreatedId(response));
+        }
+        grantRealmManagementRole(testRealm, adminGroup, AdminRoles.REALM_ADMIN);
+
+        UserRepresentation victim = createUser(testRealm, "target-user");
+
+        assertThrows(ForbiddenException.class, () -> {
+            runAs(realmName, "admin-cli", attackerName, attackerClient -> {
+                attackerClient.realm(realmName).users().get(victim.getId()).joinGroup(adminGroup.getId());
+            });
+        });
+    }
+
+    @Test
+    public void testManageUsersAdminCanJoinUserToNonAdminGroup() {
+        String realmName = "test-realm";
+        RealmResource testRealm = createRealm(adminClient, realmName);
+        String adminName = "limited-admin";
+        createUser(testRealm, adminName);
+        grantRealmManagementRole(testRealm, adminName, AdminRoles.MANAGE_USERS);
+
+        GroupRepresentation safeGroup = new GroupRepresentation();
+        safeGroup.setName("safe-group");
+        try (Response response = testRealm.groups().add(safeGroup)) {
+            safeGroup.setId(ApiUtil.getCreatedId(response));
+        }
+
+        UserRepresentation user = createUser(testRealm, "normal-user");
+
+        runAs(realmName, "admin-cli", adminName, adminClient -> {
+            adminClient.realm(realmName).users().get(user.getId()).joinGroup(safeGroup.getId());
+        });
+
+        assertTrue(testRealm.users().get(user.getId()).groups().stream()
+                .anyMatch(g -> g.getName().equals("safe-group")));
+    }
+
+    @Test
+    public void testRealmAdminCanStillJoinUserToAdminGroup() {
+        String realmName = "test-realm";
+        RealmResource testRealm = createRealm(adminClient, realmName);
+        String realmAdminName = "full-admin";
+        createUser(testRealm, realmAdminName);
+        grantRealmManagementRole(testRealm, realmAdminName, AdminRoles.REALM_ADMIN);
+
+        GroupRepresentation adminGroup = new GroupRepresentation();
+        adminGroup.setName("realm-admin-group");
+        try (Response response = testRealm.groups().add(adminGroup)) {
+            adminGroup.setId(ApiUtil.getCreatedId(response));
+        }
+        grantRealmManagementRole(testRealm, adminGroup, AdminRoles.REALM_ADMIN);
+
+        UserRepresentation user = createUser(testRealm, "normal-user");
+
+        runAs(realmName, "admin-cli", realmAdminName, adminClient -> {
+            adminClient.realm(realmName).users().get(user.getId()).joinGroup(adminGroup.getId());
+        });
+
+        assertTrue(testRealm.users().get(user.getId()).groups().stream()
+                .anyMatch(g -> g.getName().equals("realm-admin-group")));
+    }
+
+    @Test
+    public void testManageUsersAdminCannotCreateUserWithAdminGroup() {
+        String realmName = "test-realm";
+        RealmResource testRealm = createRealm(adminClient, realmName);
+        String attackerName = "limited-admin";
+        createUser(testRealm, attackerName);
+        grantRealmManagementRole(testRealm, attackerName, AdminRoles.MANAGE_USERS);
+
+        GroupRepresentation adminGroup = new GroupRepresentation();
+        adminGroup.setName("realm-admin-group");
+        try (Response response = testRealm.groups().add(adminGroup)) {
+            adminGroup.setId(ApiUtil.getCreatedId(response));
+        }
+        grantRealmManagementRole(testRealm, adminGroup, AdminRoles.REALM_ADMIN);
+
+        assertThrows(ForbiddenException.class, () -> {
+            runAs(realmName, "admin-cli", attackerName, attackerClient -> {
+                UserRepresentation newUser = UserBuilder.create()
+                        .username("escalated-user")
+                        .email("escalated@keycloak.org")
+                        .firstName("First")
+                        .lastName("Last")
+                        .password("password")
+                        .enabled(true)
+                        .groups("/realm-admin-group")
+                        .build();
+                try (Response resp = attackerClient.realm(realmName).users().create(newUser)) {
+                    if (resp.getStatus() == Status.FORBIDDEN.getStatusCode()) {
+                        throw new ForbiddenException("Forbidden");
+                    }
+                }
+            });
+        });
+    }
+
+    @Test
+    public void testManageUsersAdminCannotJoinUserToGroupWithCompositeAdminRole() {
+        String realmName = "test-realm";
+        RealmResource testRealm = createRealm(adminClient, realmName);
+        String attackerName = "limited-admin";
+        createUser(testRealm, attackerName);
+        grantRealmManagementRole(testRealm, attackerName, AdminRoles.MANAGE_USERS);
+
+        testRealm.roles().create(RoleBuilder.create().name("sneaky-composite").build());
+        ClientRepresentation realmMgmt = testRealm.clients()
+                .findByClientId(Constants.REALM_MANAGEMENT_CLIENT_ID).get(0);
+        RoleRepresentation manageRealm = testRealm.clients().get(realmMgmt.getId())
+                .roles().get(AdminRoles.MANAGE_REALM).toRepresentation();
+        testRealm.roles().get("sneaky-composite").addComposites(List.of(manageRealm));
+
+        GroupRepresentation compositeGroup = new GroupRepresentation();
+        compositeGroup.setName("composite-admin-group");
+        try (Response response = testRealm.groups().add(compositeGroup)) {
+            compositeGroup.setId(ApiUtil.getCreatedId(response));
+        }
+
+        RoleRepresentation sneakyRole = testRealm.roles().get("sneaky-composite").toRepresentation();
+        testRealm.groups().group(compositeGroup.getId()).roles().realmLevel().add(List.of(sneakyRole));
+
+        UserRepresentation victim = createUser(testRealm, "target-user");
+
+        assertThrows(ForbiddenException.class, () -> {
+            runAs(realmName, "admin-cli", attackerName, attackerClient -> {
+                attackerClient.realm(realmName).users().get(victim.getId()).joinGroup(compositeGroup.getId());
+            });
+        });
+    }
+
+    @Test
+    public void testManageUsersAdminCannotAddOrgMemberToAdminGroupViaOrgEndpoint() {
+        String realmName = "test-realm";
+        RealmResource testRealm = createRealm(adminClient, realmName);
+
+        // enable organizations
+        RealmRepresentation realmRep = testRealm.toRepresentation();
+        realmRep.setOrganizationsEnabled(true);
+        testRealm.update(realmRep);
+
+        String attackerName = "limited-admin";
+        createUser(testRealm, attackerName);
+        grantRealmManagementRole(testRealm, attackerName, AdminRoles.MANAGE_USERS);
+
+        // create org + add member
+        OrganizationRepresentation org = new OrganizationRepresentation();
+        org.setName("test-org");
+        OrganizationDomainRepresentation domain = new OrganizationDomainRepresentation();
+        domain.setName("test-org.com");
+        org.addDomain(domain);
+        String orgId;
+        try (Response response = testRealm.organizations().create(org)) {
+            orgId = ApiUtil.getCreatedId(response);
+        }
+
+        UserRepresentation victim = createUser(testRealm, "target-user");
+        testRealm.organizations().get(orgId).members().addMember(victim.getId()).close();
+
+        // create org group and give it admin roles
+        GroupRepresentation adminGroup = new GroupRepresentation();
+        adminGroup.setName("org-admin-group");
+        String groupId;
+        try (Response response = testRealm.organizations().get(orgId).groups().addTopLevelGroup(adminGroup)) {
+            groupId = ApiUtil.getCreatedId(response);
+        }
+        adminGroup.setId(groupId);
+        // assign admin role via org groups API (realm groups API blocks org-related groups)
+        ClientRepresentation realmMgmt = testRealm.clients().findByClientId(Constants.REALM_MANAGEMENT_CLIENT_ID).get(0);
+        RoleRepresentation realmAdminRole = testRealm.clients().get(realmMgmt.getId()).roles().get(AdminRoles.REALM_ADMIN).toRepresentation();
+        testRealm.organizations().get(orgId).groups().group(groupId).roles().clientLevel(realmMgmt.getId()).add(List.of(realmAdminRole));
+
+        // limited admin should be forbidden from adding member to admin group via org endpoint
+        assertThrows(ForbiddenException.class, () -> {
+            runAs(realmName, "admin-cli", attackerName, attackerClient -> {
+                attackerClient.realm(realmName).organizations().get(orgId).groups().group(groupId).addMember(victim.getId());
+            });
+        });
     }
 
     private void grantRealmManagementRole(RealmResource testRealm, GroupRepresentation group, String role) {

@@ -24,6 +24,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Function;
 import java.util.stream.Stream;
+import javax.xml.stream.XMLStreamException;
 
 import jakarta.ws.rs.BadRequestException;
 import jakarta.ws.rs.Consumes;
@@ -62,6 +63,7 @@ import org.keycloak.organization.utils.Organizations;
 import org.keycloak.provider.ProviderFactory;
 import org.keycloak.representations.idm.CertificateRepresentation;
 import org.keycloak.representations.idm.IdentityProviderRepresentation;
+import org.keycloak.saml.common.exceptions.ParsingException;
 import org.keycloak.services.ErrorResponse;
 import org.keycloak.services.ErrorResponseException;
 import org.keycloak.services.resources.KeycloakOpenAPI;
@@ -70,6 +72,7 @@ import org.keycloak.services.util.CertificateInfoHelper;
 import org.keycloak.utils.ReservedCharValidator;
 import org.keycloak.utils.StringUtil;
 
+import org.apache.http.client.HttpResponseException;
 import org.eclipse.microprofile.openapi.annotations.Operation;
 import org.eclipse.microprofile.openapi.annotations.extensions.Extension;
 import org.eclipse.microprofile.openapi.annotations.parameters.Parameter;
@@ -194,9 +197,38 @@ public class IdentityProvidersResource {
 
         String providerId = data.get("providerId").toString();
         String from = data.get("fromUrl").toString();
-        String file = session.getProvider(HttpClientProvider.class).getString(from);
+
+        String file;
+        try {
+            file = session.getProvider(HttpClientProvider.class).getString(from);
+        } catch (IOException | IllegalArgumentException e) {
+            // Only report the response status, transport errors can reveal internal addresses
+            logger.debug("Failed to fetch identity provider metadata", e);
+            String message = "Cannot fetch identity provider metadata";
+            if (e instanceof HttpResponseException responseException) {
+                message += ": HTTP " + responseException.getStatusCode();
+            }
+            throw ErrorResponse.error(message, BAD_REQUEST);
+        }
+
         IdentityProviderFactory providerFactory = getProviderFactoryById(providerId);
-        Map<String, String> config = providerFactory.parseConfig(session, file);
+
+        Map<String, String> config;
+        try {
+            config = providerFactory.parseConfig(session, file);
+        } catch (RuntimeException e) {
+            // The factories report an unusable document by the cause they wrap, except for a SAML
+            // document that parses into something other than an entity descriptor
+            if (!(e instanceof ClassCastException
+                    || e.getCause() instanceof IOException
+                    || e.getCause() instanceof ParsingException
+                    || e.getCause() instanceof XMLStreamException)) {
+                throw e;
+            }
+            logger.debug("Failed to parse identity provider metadata", e);
+            throw ErrorResponse.error("Cannot parse identity provider metadata", BAD_REQUEST);
+        }
+
         // add the URL just if needed by the identity provider
         config.put(IdentityProviderModel.METADATA_DESCRIPTOR_URL, from);
         return config;
@@ -233,7 +265,11 @@ public class IdentityProvidersResource {
 
         Function<IdentityProviderModel, IdentityProviderRepresentation> toRepresentation = Optional.ofNullable(briefRepresentation).orElse(false)
                 ? m -> ModelToRepresentation.toBriefRepresentation(realm, m)
-                : m -> StripSecretsUtils.stripSecrets(session, ModelToRepresentation.toRepresentation(session, realm, m));
+                : m -> {
+                    IdentityProviderRepresentation rep = StripSecretsUtils.stripSecrets(session, ModelToRepresentation.toRepresentation(session, realm, m));
+                    Organizations.filterOrganizationLinks(rep, session, auth);
+                    return rep;
+                };
 
         boolean searchRealmOnlyIDPs = Optional.ofNullable(realmOnly).orElse(false);
 
@@ -332,4 +368,5 @@ public class IdentityProvidersResource {
         return Stream.concat(session.getKeycloakSessionFactory().getProviderFactoriesStream(IdentityProvider.class),
                 session.getKeycloakSessionFactory().getProviderFactoriesStream(SocialIdentityProvider.class));
     }
+
 }
